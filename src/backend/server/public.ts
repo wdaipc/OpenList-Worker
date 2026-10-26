@@ -17,6 +17,11 @@ import {
   readFormat,
 } from "../internal/model/store/backend"
 import { setUserPassword } from "../pkg/password"
+import {
+  describeCacheConfig,
+  getCacheDrivers,
+  isCacheActive,
+} from "../internal/cache"
 // 脱敏 / 截断 / 摘要 / 建议组装：与全局 503 拦截（index.ts）共用同一套规则
 import {
   reasonLines,
@@ -279,6 +284,19 @@ publicRouter.get("/env_check", async (c) => {
   // 但不再因此阻断向导。
   const ready = storageAvailable
 
+  // ── 缓存状态（文件树 / 下载链接）──
+  // 默认只向数据库启用（CACHE_DRIVER=db）；配置了 KV/Blob 等专用后端时
+  // 这里会如实回显实际生效的后端列表，便于排查「以为缓存在 KV」的错觉。
+  const cacheConfig = describeCacheConfig(env)
+  let cacheActive = false
+  let cacheDrivers: string[] = []
+  try {
+    cacheActive = await isCacheActive(env)
+    cacheDrivers = (await getCacheDrivers(env)).map((d) => d.name)
+  } catch {
+    cacheActive = false
+  }
+
   return c.json({
     code: 200,
     message: "success",
@@ -286,6 +304,13 @@ publicRouter.get("/env_check", async (c) => {
       runtime: {
         serverless,
         platform: storage?.platform ?? null,
+      },
+      cache: {
+        ...cacheConfig,
+        /** 是否已有可用缓存后端（false 时缓存自动降级为不缓存） */
+        active: cacheActive,
+        /** 实际解析出的后端驱动名（`db` 会展开成 d1/kv/blob/... ） */
+        resolved_backends: cacheDrivers,
       },
       config: {
         // 配置值（用户显式设置，或默认值）
@@ -398,6 +423,10 @@ publicRouter.get("/settings", async (c) => {
     // IMPORTANT: share_preview must be "true" — frontend blocks ALL previews when false
     share_preview: "true",
     share_archive_preview: "true",
+    // 「复制链接」渲染的模板。缺失或为空时会渲染成空串，
+    // `navigator.clipboard.writeText("")` 会清空剪贴板，按钮照常弹「已复制」
+    // 但粘贴出来是空的。默认输出纯分享 URL，与按钮文案一致。
+    share_summary_content: "{{base_url}}/@s/{{id}}",
 
     // --- Global ---
     hide_files: "/\\.DS_Store/i",

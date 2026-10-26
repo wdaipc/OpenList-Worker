@@ -41,6 +41,23 @@ const DEFAULT_PROXY_IGNORE_HEADERS = "authorization,referer"
 const LEGACY_TEXT_TYPES =
   "txt,htm,html,xml,java,properties,sql,js,json,c,cpp,python,py,php,go,rst,css,typescript,ts,log,conf,yaml,yml,cmd,bash,sh,vue,ini"
 
+/**
+ * 分享摘要/「复制链接」默认模板。
+ *
+ * 前端「复制链接」= matchTemplate(getSetting("share_summary_content"), data)。
+ * 模板为空时结果就是空串，`writeText("")` 会清空剪贴板，于是按钮弹出「已复制」
+ * 但剪贴板里什么都没有——分享管理页的复制链接因此完全不可用。
+ *
+ * 这里输出**纯分享 URL**，与按钮文案（Copy link / 复制链接）以及文件工具栏
+ * 「分享」对话框里 `copy(link())` 的行为保持一致。上游 Go 的默认值是一整段
+ * 社交分享文案（LEGACY_SHARE_SUMMARY_GO），对「复制链接」按钮而言属于误导性
+ * 行为，故不采用；已写入该文案的实例由 LEGACY_SETTING_MIGRATIONS 迁移过来。
+ */
+const DEFAULT_SHARE_SUMMARY_CONTENT = "{{base_url}}/@s/{{id}}"
+
+/** 上一版曾采用的上游 Go 分享摘要文案（仅用于迁移到纯链接） */
+const LEGACY_SHARE_SUMMARY_GO = `@{{creator}} shared {{#each files}}{{#if @first}}"{{filename this}}"{{/if}}{{#if @last}}{{#unless (eq @index 0)}} and {{@index}} more files{{/unless}}{{/if}}{{/each}} from {{site_title}}: {{base_url}}/@s/{{id}}{{#if pwd}} , the share code is {{pwd}}{{/if}}{{#if expires}}, please access before {{dateLocaleString expires}}.{{/if}}`
+
 // Global default configuration payload for Cloudflare Workers
 export const defaultDb = {
   settings: [
@@ -509,7 +526,7 @@ export const defaultDb = {
     },
     {
       key: "share_summary_content",
-      value: "",
+      value: DEFAULT_SHARE_SUMMARY_CONTENT,
       type: "text",
       help: "Share Summary Content",
       group: 4,
@@ -917,6 +934,17 @@ export function setEnvCtx(env: any) {
   }
 }
 
+/**
+ * 读取请求级 env 上下文（由 setEnvCtx 写入）。
+ *
+ * 供**驱动层**解析平台绑定（如 R2 bucket binding）：驱动的 list/get/put
+ * 签名里没有 env 参数，而 Workers 只会把绑定放进请求的 env，因此必须经这里
+ * 回取。拿不到时返回 null（非 Workers 运行时 / 单元测试），由调用方决定回退。
+ */
+export function getEnvCtx(): any | null {
+  return globalEnvCtx || null
+}
+
 // 已知的旧默认值 → 当前默认值迁移表。
 // 修复「开发环境(无 KV，用新默认值)与生产环境(KV 里保存了旧默认值)不一致」：
 // 早期默认 logo/favicon 为空或 res.oplist.org 旧地址，已写入 KV 的旧值不会被
@@ -943,6 +971,12 @@ const LEGACY_SETTING_MIGRATIONS: Record<string, { from: any[]; to: string }> = {
   text_types: {
     from: [LEGACY_TEXT_TYPES],
     to: DEFAULT_TEXT_TYPES,
+  },
+  // 「复制链接」：早期 seed 为空串（复制出空白），上一版一度采用上游 Go 的
+  // 整段分享文案（复制出一堆非链接内容）。两种已写入的值都迁移到纯分享 URL。
+  share_summary_content: {
+    from: ["", LEGACY_SHARE_SUMMARY_GO],
+    to: DEFAULT_SHARE_SUMMARY_CONTENT,
   },
 }
 
@@ -2043,6 +2077,15 @@ export const saveDb = async (
     return false
   }
 
+  // 记录写入前的内存状态，供持久化失败时回滚。
+  //
+  // 稳定性不变量：**持久化失败后，失败的修改不得在内存/请求缓存中生效**。
+  // 历史实现先更新 memoryDb 与 dbCache、再尝试落盘，失败只抛错不回滚。
+  // 结果是「接口报 500，但当前实例的角色/权限/设置已按未保存的内容生效」——
+  // 调用方以为失败、系统却按新值运行（实测：保存失败后 getDb() 仍读到新 role）。
+  const previousDb = memoryDb
+  const previousTrusted = dbTrusted
+
   memoryDb = data
   dbWriteBlocked = false
   // Refresh the request cache so any getDb() later in this request observes
@@ -2089,6 +2132,14 @@ export const saveDb = async (
     )
     await backend.save(sealed, activeEnv)
   } catch (err: any) {
+    // 回滚内存与请求缓存：持久化没成功，就不能让本次修改在本实例内可见，
+    // 否则会出现「报错但已生效」的不一致状态。
+    memoryDb = previousDb
+    dbTrusted = previousTrusted
+    if (cacheKey) {
+      if (previousDb) dbCache.set(cacheKey, { ts: Date.now(), db: previousDb })
+      else dbCache.delete(cacheKey)
+    }
     console.error(
       `[DB] saveDb FAILED: backend=${backend.name}, error=${err?.message || err}`,
       `stack=${err?.stack?.substring(0, 500) || ""}`,
